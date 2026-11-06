@@ -1,0 +1,106 @@
+import http from 'node:http';
+import { readFile, mkdir, chmod } from 'node:fs/promises';
+import { extname, resolve, sep } from 'node:path';
+import { randomBytes, createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { analyze } from './lib/quant.mjs';
+import { validPin, hashPin, verifyPin, choosePin } from './lib/pin.mjs';
+
+const root = resolve('public'), data = resolve(process.env.APERTURE_DATA_DIR || 'data');
+const port = Number(process.env.PORT || 7421);
+await mkdir(data, { recursive:true, mode:0o700 }); await chmod(data, 0o700);
+const db = new DatabaseSync(resolve(data, 'aperture.sqlite'));
+await chmod(resolve(data, 'aperture.sqlite'), 0o600);
+db.exec(`PRAGMA journal_mode = DELETE; CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS snapshots (market TEXT PRIMARY KEY, value TEXT NOT NULL, updated TEXT NOT NULL);`);
+const get = key => db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value;
+const set = (key,value) => db.prepare('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key,value);
+if (!get('pin_hash')) {
+  const pin = process.env.APERTURE_PIN !== undefined ? process.env.APERTURE_PIN : await choosePin();
+  if (!validPin(pin)) throw new Error('PIN must be 6–12 digits. No PIN was saved.');
+  const {salt, hash} = hashPin(pin);
+  db.exec('BEGIN');
+  try { set('pin_salt', salt); set('pin_hash', hash); db.exec('COMMIT'); }
+  catch (error) { db.exec('ROLLBACK'); throw error; }
+  console.log('Host PIN initialized.');
+}
+
+const sessions = new Map(), attempts = new Map(), listeners = new Set();
+const validMarkets = ['indian','foreign','crypto'];
+const defaults = {indian:['RELIANCE.NS','INFY.NS','HDFCBANK.NS'],foreign:['AAPL','MSFT','SPY'],crypto:['BTC-USD','ETH-USD','SOL-USD']};
+let paused = get('paused') === 'true', running = false, generation = 0;
+const types = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
+function send(res, status, value, extra={}) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}); res.end(JSON.stringify(value)); }
+function snapshot(market) { const row=db.prepare('SELECT value,updated FROM snapshots WHERE market=?').get(market); return row ? {signals:JSON.parse(row.value),updated:row.updated} : {signals:[],updated:null}; }
+function state(market){return {market,...snapshot(market),paused,running, keyHealth:'LLM reasoning unavailable — math signals only.', readiness:null,positions:[],learning:null,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['No paper broker or automatic trading is configured.','Readiness cannot be calculated without a verified trade ledger.']};}
+function broadcast(){ for(const res of listeners) res.write('data: update\n\n'); }
+function validSession(req){const token = /(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1]; if (!token) return false; const hash=createHash('sha256').update(token).digest('hex'); const session=sessions.get(hash); if (!session || session.expires<Date.now() || session.pinHash!==get('pin_hash')){sessions.delete(hash);return false;} return true;}
+function checkPin(req, pin) {
+ const ip=req.socket.remoteAddress||'unknown', attempt=attempts.get(ip)||{count:0,until:0};
+ if(attempt.until>Date.now()) return {status:429,error:'Too many attempts. Try again later.'};
+ if(!verifyPin(pin,get('pin_salt'),get('pin_hash'))) {
+  attempt.count++; if(attempt.count>=5){attempt.until=Date.now()+5*60*1000;attempt.count=0;}
+  attempts.set(ip,attempt); return {status:401,error:'Incorrect PIN.'};
+ }
+ attempts.delete(ip); return null;
+}
+function sameOrigin(req){ try { return !!req.headers.origin && new URL(req.headers.origin).host === req.headers.host; } catch {return false;} }
+async function body(req){let text=''; for await (const chunk of req){text+=chunk;if(text.length>4096) throw new Error('Request too large');}return JSON.parse(text||'{}');}
+function mappedSymbol(market, input) { const s=input.trim().toUpperCase(); if(!/^[A-Z0-9][A-Z0-9.\-^=]{0,19}$/.test(s)) throw new Error('Invalid symbol'); if(market==='indian' && !s.includes('.')) return `${s}.NS`; if(market==='crypto' && !s.includes('-')) return `${s}-USD`; return s; }
+async function fetchSignal(market,symbol){
+ const response=await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d`, {headers:{'User-Agent':'Aperture-Phone/1.0'},signal:AbortSignal.timeout(12000)});
+ if(!response.ok) throw new Error(`Data provider returned ${response.status}`);
+ const json=await response.json(); const chart=json?.chart?.result?.[0]; const closes=chart?.indicators?.quote?.[0]?.close;
+ if(!Array.isArray(closes)) throw new Error('No price history available');
+ const currency=chart.meta?.currency; const unit=currency==='INR'?'₹':currency==='USD'?'$':currency ? `${String(currency).replace(/[^A-Z]/g,'').slice(0,3)} ` : '';
+ const result=analyze(symbol,closes,unit);
+ const stamp=chart.timestamp?.at(-1); result.dataTime=Number.isFinite(stamp)?new Date(stamp*1000).toISOString():null;
+ return result;
+}
+async function runScan(market,target,version){
+ try {
+   const symbols=target?[mappedSymbol(market,target)]:defaults[market];
+   const results=await Promise.allSettled(symbols.map(s=>fetchSignal(market,s)));
+   if (version!==generation || paused) return;
+   const signals=results.filter(r=>r.status==='fulfilled').map(r=>r.value).sort((a,b)=>b.conviction-a.conviction);
+   if(signals.length){const now=new Date().toISOString(); db.prepare('INSERT INTO snapshots VALUES (?,?,?) ON CONFLICT(market) DO UPDATE SET value=excluded.value,updated=excluded.updated').run(market,JSON.stringify(signals),now);}
+   lastMessage=signals.length ? `Updated ${signals.length} of ${symbols.length} symbols from the free daily feed.` : 'Data feed unavailable. The previous snapshot was kept.';
+ } catch(e){lastMessage=e.message||'Scan failed. The previous snapshot was kept.';}
+ finally {running=false;broadcast();}
+}
+let lastMessage='';
+const server=http.createServer(async(req,res)=>{
+ try {
+  const url=new URL(req.url,'http://localhost');
+  if(url.pathname.startsWith('/api/')){
+   if(req.method==='POST' && !sameOrigin(req)) return send(res,403,{error:'Origin rejected'});
+   if(url.pathname==='/api/unlock' && req.method==='POST'){
+    const input=await body(req), failure=checkPin(req,input.pin);
+    if(failure) return send(res,failure.status,{error:failure.error});
+    const token=randomBytes(32).toString('hex');sessions.set(createHash('sha256').update(token).digest('hex'),{expires:Date.now()+8*60*60*1000,pinHash:get('pin_hash')});
+    return send(res,200,{ok:true},{'Set-Cookie':`aperture_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`});
+   }
+   if(!validSession(req)) return send(res,401,{error:'Unlock required'});
+   // Deliberately fail closed: no live broker or verified readiness gate exists.
+   // Any future implementation must keep the session, origin, market and PIN checks
+   // before evaluating broker/readiness requirements and changing execution mode.
+   if(url.pathname==='/api/live/activate' && req.method==='POST'){
+    const input=await body(req);
+    if(!validMarkets.includes(input.market)) return send(res,400,{error:'Invalid market'});
+    const failure=checkPin(req,input.pin);
+    if(failure) return send(res,failure.status,{error:failure.error});
+    return send(res,503,{error:'Live trading is unavailable: no live broker or verified readiness gate is configured.'});
+   }
+   if(url.pathname==='/api/logout' && req.method==='POST'){const token=/(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1];if(token)sessions.delete(createHash('sha256').update(token).digest('hex'));return send(res,200,{ok:true},{'Set-Cookie':'aperture_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
+   if(url.pathname==='/api/state' && req.method==='GET'){const market=url.searchParams.get('market');if(!validMarkets.includes(market))return send(res,400,{error:'Invalid market'});return send(res,200,{...state(market),message:lastMessage});}
+   if(url.pathname==='/api/events' && req.method==='GET'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});res.write(': connected\n\n');listeners.add(res);req.on('close',()=>listeners.delete(res));return;}
+   if(url.pathname==='/api/run' && req.method==='POST'){const input=await body(req);if(!validMarkets.includes(input.market))return send(res,400,{error:'Invalid market'});if(paused)return send(res,409,{error:'Engine paused. Resume before running.'});if(running)return send(res,409,{error:'A scan is already running.'});try {if(input.target) mappedSymbol(input.market,String(input.target));}catch(e){return send(res,400,{error:e.message});}running=true;lastMessage='Scan running…';broadcast();void runScan(input.market,String(input.target||''),generation);return send(res,202,{ok:true});}
+   if(url.pathname==='/api/pause' && req.method==='POST'){const input=await body(req);if(typeof input.paused!=='boolean')return send(res,400,{error:'Invalid state'});paused=input.paused;set('paused',String(paused));if(paused)generation++;lastMessage=paused?'Engine paused. An in-flight scan will be discarded.':'Engine resumed.';broadcast();return send(res,200,{ok:true,paused});}
+   return send(res,404,{error:'Not found'});
+  }
+  if(req.method!=='GET' && req.method!=='HEAD'){res.writeHead(405).end();return;}
+  const pathname=decodeURIComponent(url.pathname), file=resolve(root,'.'+(pathname==='/'?'/index.html':pathname));
+  if(!file.startsWith(root+sep)){res.writeHead(403).end();return;}
+  const content=await readFile(file);res.writeHead(200,{'Content-Type':types[extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':pathname==='/sw.js'?'no-cache':'no-store','Content-Security-Policy':"default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'"});res.end(content);
+ }catch(e){if(!res.headersSent)send(res,400,{error:'Request could not be processed'});else res.end();}
+});
+server.listen(port,'0.0.0.0',()=>console.log(`Aperture phone: http://localhost:${port} (LAN accessible; use only on a trusted network)`));
