@@ -1,0 +1,17 @@
+{
+  "name": "aperture-phone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/app.ts --bundle --minify --target=es2020 --outfile=public/app.js",
+    "start": "npm run build && node server.js",
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "change-pin": "node tools/change-pin.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3"
+  }
+}
