@@ -18,6 +18,14 @@ test('PIN authentication, same-origin writes and durable pause', async t=>{
  let r=await fetch(`${origin}/api/state?market=indian`); assert.equal(r.status,401);
  r=await fetch(`${origin}/api/unlock`,{method:'POST',headers:{origin,'content-type':'application/json'},body:JSON.stringify({pin:'000000'})});assert.equal(r.status,401);
  r=await fetch(`${origin}/api/unlock`,{method:'POST',headers:{origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456'})});assert.equal(r.status,200);const cookie=r.headers.get('set-cookie').split(';')[0];
+ // Key management requires a session, host PIN and secure transport; never return the secret.
+ const secret='sk-or-v1-0123456789abcdef';
+ r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',key:secret})});assert.equal(r.status,401);
+ r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{cookie,host:`example.com:${port}`,origin:`http://example.com:${port}`,'content-type':'application/json'},body:JSON.stringify({pin:'123456',key:secret})});assert.equal(r.status,403);
+ r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'999999',key:secret})});assert.equal(r.status,401);
+ r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',key:secret})});assert.equal(r.status,201);const created=await r.json();assert.equal(JSON.stringify(created).includes(secret),false);const keyId=created.keys[0].id;
+ r=await fetch(`${origin}/api/keys`,{headers:{cookie}});const listed=await r.json();assert.equal(listed.canManage,true);assert.equal(listed.keys.length,1);assert.equal(JSON.stringify(listed).includes(secret),false);
+ r=await fetch(`${origin}/api/keys/remove`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',id:keyId})});assert.equal(r.status,200);assert.equal((await r.json()).keys.length,0);
  // A session is not sufficient: live activation re-verifies the original PIN and always fails closed.
  r=await fetch(`${origin}/api/live/activate`,{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"market":"indian","pin":"123456"}'});assert.equal(r.status,401);
  r=await fetch(`${origin}/api/live/activate`,{method:'POST',headers:{cookie,origin:'http://evil.test','content-type':'application/json'},body:'{"market":"indian","pin":"123456"}'});assert.equal(r.status,403);
