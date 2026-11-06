@@ -2,7 +2,46 @@
 
 A local, phone-first **paper-only analysis companion in development**. The host can fetch free daily price history, produce a simple deterministic trend screen, preserve the most recent successful sheet, and let a paired phone pause or resume scans. Signals are not advice, orders, a verified strategy, or proof of profitability. The upstream feed may be delayed, rate-limited, unavailable, or change without notice.
 
-## Start
+## Termux on Android
+
+Install a current version of [Termux](https://termux.dev/) first. Run these commands **in Termux**, not in the Android browser. Keep the project in Termux's home directory rather than shared phone storage.
+
+### 1. Install prerequisites (once)
+
+```sh
+pkg update && pkg upgrade -y
+pkg install -y git nodejs-lts npm
+node --version
+```
+
+Node.js **22.13 or newer** is required for the built-in SQLite module. If the printed version is older, update your Termux packages before continuing.
+
+### 2. Download and start for the first time
+
+```sh
+cd ~
+git clone https://github.com/thisgmailisminelilfella-dev/aprture-mibole.git
+cd aprture-mibole
+npm ci --include=dev
+npm start
+```
+
+When prompted in Termux, choose and confirm a **6–12 digit PIN**. The PIN will not appear while you type it. Once the server starts, open **http://localhost:7421** in the browser on the same phone and enter that PIN. Leave Termux running while you use Aperture; press **Ctrl+C** in Termux to stop it. If you already cloned the project, skip `git clone` and use your existing project directory instead.
+
+### 3. Start again later
+
+Open Termux and run:
+
+```sh
+cd ~/aprture-mibole
+npm start
+```
+
+Open **http://localhost:7421** again. Use the PIN you created on first startup; it is not recreated on subsequent starts. To change it, stop the server and run `npm run change-pin` from the project directory.
+
+Termux and Android may stop background processes, so restart the command if the page cannot connect. Termux itself has not been tested in this development environment. The server listens on the network as well as localhost; use it only on trusted networks and do not expose its port to the internet.
+
+## Start on other systems
 
 Requires Node.js **22.13+** (the application uses Node's built-in SQLite) and npm.
 
