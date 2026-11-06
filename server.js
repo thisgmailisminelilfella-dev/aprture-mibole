@@ -1,9 +1,11 @@
 import http from 'node:http';
+import https from 'node:https';
 import { readFile, mkdir, chmod } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { analyze } from './lib/quant.mjs';
+import { createKeyPool } from './lib/key-pool.mjs';
 import { validPin, hashPin, verifyPin, choosePin } from './lib/pin.mjs';
 
 const root = resolve('public'), data = resolve(process.env.APERTURE_DATA_DIR || 'data');
@@ -24,6 +26,7 @@ if (!get('pin_hash')) {
   console.log('Host PIN initialized.');
 }
 
+const keyPool = await createKeyPool(db, data);
 const sessions = new Map(), attempts = new Map(), listeners = new Set();
 const validMarkets = ['indian','foreign','crypto'];
 const defaults = {indian:['RELIANCE.NS','INFY.NS','HDFCBANK.NS'],foreign:['AAPL','MSFT','SPY'],crypto:['BTC-USD','ETH-USD','SOL-USD']};
@@ -31,7 +34,7 @@ let paused = get('paused') === 'true', running = false, generation = 0;
 const types = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
 function send(res, status, value, extra={}) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}); res.end(JSON.stringify(value)); }
 function snapshot(market) { const row=db.prepare('SELECT value,updated FROM snapshots WHERE market=?').get(market); return row ? {signals:JSON.parse(row.value),updated:row.updated} : {signals:[],updated:null}; }
-function state(market){return {market,...snapshot(market),paused,running, keyHealth:'LLM reasoning unavailable — math signals only.', readiness:null,positions:[],learning:null,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['No paper broker or automatic trading is configured.','Readiness cannot be calculated without a verified trade ledger.']};}
+function state(market){return {market,...snapshot(market),paused,running, keyHealth:keyPool.list().some(k=>k.status==='ready')?'Free-tier pool ready': 'LLM reasoning degraded — math signals only.', keyPool:keyPool.list(), readiness:null,positions:[],learning:null,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['No paper broker or automatic trading is configured.','Readiness cannot be calculated without a verified trade ledger.']};}
 function broadcast(){ for(const res of listeners) res.write('data: update\n\n'); }
 function validSession(req){const token = /(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1]; if (!token) return false; const hash=createHash('sha256').update(token).digest('hex'); const session=sessions.get(hash); if (!session || session.expires<Date.now() || session.pinHash!==get('pin_hash')){sessions.delete(hash);return false;} return true;}
 function checkPin(req, pin) {
@@ -42,6 +45,13 @@ function checkPin(req, pin) {
   attempts.set(ip,attempt); return {status:401,error:'Incorrect PIN.'};
  }
  attempts.delete(ip); return null;
+}
+// Never accept key material or a re-authentication PIN over unencrypted remote LAN HTTP.
+function secureKeyTransport(req){
+ if(req.socket.encrypted) return true;
+ const remote=req.socket.remoteAddress;
+ const isLoopback=remote==='127.0.0.1'||remote==='::1'||remote==='::ffff:127.0.0.1';
+ try {const host=new URL(`http://${req.headers.host}`).hostname; return isLoopback && (host==='localhost'||host==='127.0.0.1'||host==='[::1]');}catch{return false;}
 }
 function sameOrigin(req){ try { return !!req.headers.origin && new URL(req.headers.origin).host === req.headers.host; } catch {return false;} }
 async function body(req){let text=''; for await (const chunk of req){text+=chunk;if(text.length>4096) throw new Error('Request too large');}return JSON.parse(text||'{}');}
@@ -62,13 +72,20 @@ async function runScan(market,target,version){
    const results=await Promise.allSettled(symbols.map(s=>fetchSignal(market,s)));
    if (version!==generation || paused) return;
    const signals=results.filter(r=>r.status==='fulfilled').map(r=>r.value).sort((a,b)=>b.conviction-a.conviction);
-   if(signals.length){const now=new Date().toISOString(); db.prepare('INSERT INTO snapshots VALUES (?,?,?) ON CONFLICT(market) DO UPDATE SET value=excluded.value,updated=excluded.updated').run(market,JSON.stringify(signals),now);}
+   if(signals.length){
+     const writeSnapshot=()=>db.prepare('INSERT INTO snapshots VALUES (?,?,?) ON CONFLICT(market) DO UPDATE SET value=excluded.value,updated=excluded.updated').run(market,JSON.stringify(signals),new Date().toISOString());
+     // Publish the quant result first; a slow or unavailable model must not hold it back.
+     writeSnapshot();lastMessage='Quant signals ready; checking the free model pool…';broadcast();
+     const summary=await keyPool.synthesize(signals);
+     if (version!==generation || paused) return;
+     if(summary) {signals[0].llmNote=summary;writeSnapshot();}
+   }
    lastMessage=signals.length ? `Updated ${signals.length} of ${symbols.length} symbols from the free daily feed.` : 'Data feed unavailable. The previous snapshot was kept.';
  } catch(e){lastMessage=e.message||'Scan failed. The previous snapshot was kept.';}
  finally {running=false;broadcast();}
 }
 let lastMessage='';
-const server=http.createServer(async(req,res)=>{
+const handler=async(req,res)=>{
  try {
   const url=new URL(req.url,'http://localhost');
   if(url.pathname.startsWith('/api/')){
@@ -90,6 +107,21 @@ const server=http.createServer(async(req,res)=>{
     if(failure) return send(res,failure.status,{error:failure.error});
     return send(res,503,{error:'Live trading is unavailable: no live broker or verified readiness gate is configured.'});
    }
+   if(url.pathname==='/api/keys' && req.method==='GET') return send(res,200,{keys:keyPool.list(), canManage:secureKeyTransport(req)});
+   if(url.pathname==='/api/keys' && req.method==='POST'){
+    if(!secureKeyTransport(req)) return send(res,403,{error:'Manage keys on localhost or through direct HTTPS; remote HTTP is not secure.'});
+    const input=await body(req), failure=checkPin(req,input.pin);
+    if(failure) return send(res,failure.status,{error:failure.error});
+    try {keyPool.add(input.key);broadcast();return send(res,201,{ok:true,keys:keyPool.list()});}
+    catch(e) {return send(res,400,{error:e.message});}
+   }
+   if(url.pathname==='/api/keys/remove' && req.method==='POST'){
+    if(!secureKeyTransport(req)) return send(res,403,{error:'Manage keys on localhost or through direct HTTPS; remote HTTP is not secure.'});
+    const input=await body(req), failure=checkPin(req,input.pin);
+    if(failure) return send(res,failure.status,{error:failure.error});
+    if(typeof input.id!=='string'||!keyPool.remove(input.id)) return send(res,404,{error:'Key not found.'});
+    broadcast();return send(res,200,{ok:true,keys:keyPool.list()});
+   }
    if(url.pathname==='/api/logout' && req.method==='POST'){const token=/(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1];if(token)sessions.delete(createHash('sha256').update(token).digest('hex'));return send(res,200,{ok:true},{'Set-Cookie':'aperture_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
    if(url.pathname==='/api/state' && req.method==='GET'){const market=url.searchParams.get('market');if(!validMarkets.includes(market))return send(res,400,{error:'Invalid market'});return send(res,200,{...state(market),message:lastMessage});}
    if(url.pathname==='/api/events' && req.method==='GET'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});res.write(': connected\n\n');listeners.add(res);req.on('close',()=>listeners.delete(res));return;}
@@ -102,5 +134,8 @@ const server=http.createServer(async(req,res)=>{
   if(!file.startsWith(root+sep)){res.writeHead(403).end();return;}
   const content=await readFile(file);res.writeHead(200,{'Content-Type':types[extname(file)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':pathname==='/sw.js'?'no-cache':'no-store','Content-Security-Policy':"default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'"});res.end(content);
  }catch(e){if(!res.headersSent)send(res,400,{error:'Request could not be processed'});else res.end();}
-});
-server.listen(port,'0.0.0.0',()=>console.log(`Aperture phone: http://localhost:${port} (LAN accessible; use only on a trusted network)`));
+};
+const hasTls=process.env.APERTURE_TLS_CERT && process.env.APERTURE_TLS_KEY;
+if(Boolean(process.env.APERTURE_TLS_CERT)!==Boolean(process.env.APERTURE_TLS_KEY)) throw new Error('Both APERTURE_TLS_CERT and APERTURE_TLS_KEY are required for HTTPS.');
+const server=hasTls ? https.createServer({cert:await readFile(process.env.APERTURE_TLS_CERT),key:await readFile(process.env.APERTURE_TLS_KEY)},handler) : http.createServer(handler);
+server.listen(port,'0.0.0.0',()=>console.log(`Aperture phone: ${hasTls?'https':'http'}://localhost:${port} (LAN accessible; use only on a trusted network)`));
