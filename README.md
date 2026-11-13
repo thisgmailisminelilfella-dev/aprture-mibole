@@ -71,6 +71,37 @@ Run a scan, open a **LONG** signal, choose **Open paper position**, review the p
 
 The local simulator supports only whole-share long NSE cash symbols, up to 100 shares and ₹100,000 notional per position. It fills at the latest available **daily close**, not a live quote, rejects data older than 72 hours, and does not model funds, fees, slippage, settlement, shorts, derivatives, circuit limits or automatic stops. Its P/L and trade statistics are approximations, not a realistic broker simulation. If a network error occurs while submitting an Alpaca order, check the Alpaca dashboard before retrying because the broker may have received it. Alpaca's paper fills have their own simulation limitations.
 
+## Local book notes
+
+The book names in `books/` are a reading list, **not** downloaded or ingested books. Aperture cannot automatically read a PDF, extract strategies from it, or learn from it. You may import your own independently written, concise notes about material you have lawfully accessed. Each note must cite the actual title, author and page or chapter; verify it yourself. Do not use this command to import full books. Your notes are not verified and are not financial advice.
+
+To add notes on the host, stop the server with Ctrl+C, make a JSON file inside the ignored `data/` directory (for example with `nano data/book-notes.json`), and write an array using this format. Replace every example value with your own accurate source and note; the example is not a real citation:
+
+```json
+[
+  {
+    "title": "Actual book title",
+    "author": "Actual author",
+    "locator": "Page or chapter you consulted",
+    "market": "indian",
+    "strategy": "20 / 50 day trend",
+    "note": "Your own brief, independently written observation about this strategy."
+  }
+]
+```
+
+Then run:
+
+```sh
+npm run book-notes -- import data/book-notes.json
+npm run book-notes -- list
+npm start
+```
+
+`market` is `indian`, `foreign`, `crypto`, or `all`; `strategy` must match the signal's displayed strategy name (currently `20 / 50 day trend`, case-insensitive). Open a matching signal to view up to five notes with their citations. To remove one, stop the server, run `npm run book-notes -- list`, then `npm run book-notes -- remove NOTE_ID`, replacing `NOTE_ID` with the ID from the list. Each import adds new notes, so importing the same file twice creates duplicates. Imports are atomic and limited to 100 notes per file.
+
+Notes are saved in the local SQLite database across restarts, separate from paper-trade results. They appear on the authenticated phone but are not sent to AI providers, and they do not alter signals or place orders. The database and the input JSON are not encrypted; keep them on the trusted host and back up the database if needed. LAN HTTP exposes the notes in transit. Deleting a note from SQLite does not delete its original JSON input file, backups, or guarantee forensic erasure.
+
 ## How it works
 
 - Each market's default sweep requests six months of daily closes from Yahoo Finance's public chart endpoint. A target symbol can also be entered (Indian symbols without a suffix use `.NS`; crypto symbols without a pair use `-USD`). At least 50 valid closes are required. The trend screen compares 20- and 50-day simple averages and uses recent return volatility for illustrative stop/target distances. It is **not** bootstrapped or backtested. Values and market availability depend on the upstream provider. If an OpenRouter or Google AI Studio key is available, a free-tier-eligible model can add a short AI summary based only on the quantitative scan. Model output can be wrong and is not financial advice.
@@ -91,7 +122,7 @@ This server binds to all interfaces for LAN use but **does not enforce a LAN-onl
 
 ## What's not implemented
 
-There is no automatic trading, scheduler, real-money broker integration, live trading, protective-stop execution, Alpaca fill-to-strategy ledger, verified readiness score, playbook training/activation, verified Google billing status, full provider quota management, news feed, workstation build, or offline authenticated snapshot. The readiness and positions panels explicitly show missing data instead of fabricated scores or trades. `books/` contains bibliographic metadata only: the books were not downloaded, their full contents were not ingested, and their strategies are not implemented or learned automatically. Do not rely on this build for trading or risk management.
+There is no automatic trading, scheduler, real-money broker integration, live trading, protective-stop execution, Alpaca fill-to-strategy ledger, verified readiness score, playbook training/activation, verified Google billing status, full provider quota management, news feed, workstation build, or offline authenticated snapshot. The readiness and positions panels explicitly show missing data instead of fabricated scores or trades. `books/` contains bibliographic metadata only: the books were not downloaded, their full contents were not ingested, and their strategies are not implemented or learned automatically. User-authored notes, if added, are stored separately in the local database. Do not rely on this build for trading or risk management.
 
 ## Development
 
@@ -101,4 +132,4 @@ npm test
 npm run build
 ```
 
-The tests cover the basic quant calculation, PIN authentication, fail-closed live activation, same-origin write checks, key-pool encryption, migration, automatic model filtering and provider failover, persistent pause, paper-only endpoint isolation and the local Indian ledger. Alpaca calls are mocked in tests; no live paper account was tested. They do not validate market data accuracy or trading performance.
+The tests cover the basic quant calculation, PIN authentication, fail-closed live activation, same-origin write checks, key-pool encryption, migration, automatic model filtering and provider failover, persistent pause, paper-only endpoint isolation, the local Indian ledger, and persistent book-note import and matching. Alpaca calls are mocked in tests; no live paper account was tested. They do not validate market data accuracy or trading performance.

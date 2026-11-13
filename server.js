@@ -5,6 +5,7 @@ import { extname, resolve, sep } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { analyze } from './lib/quant.mjs';
+import { createBookKnowledge } from './lib/book-knowledge.mjs';
 import { createIndiaPaper } from './lib/india-paper.mjs';
 import { createAlpacaPaper } from './lib/alpaca-paper.mjs';
 import { createKeyPool } from './lib/key-pool.mjs';
@@ -30,6 +31,7 @@ if (!get('pin_hash')) {
 
 const keyPool = await createKeyPool(db, data);
 const indiaPaper=createIndiaPaper(db);
+const bookKnowledge=createBookKnowledge(db);
 const alpaca=createAlpacaPaper({keyId:process.env.ALPACA_PAPER_KEY_ID,secretKey:process.env.ALPACA_PAPER_SECRET_KEY});
 const paperRequests=new Set();
 const sessions = new Map(), attempts = new Map(), listeners = new Set();
@@ -39,7 +41,7 @@ let paused = get('paused') === 'true', running = false, generation = 0, scanCont
 const types = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
 function send(res, status, value, extra={}) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}); res.end(JSON.stringify(value)); }
 function snapshot(market) { const row=db.prepare('SELECT value,updated FROM snapshots WHERE market=?').get(market); return row ? {signals:JSON.parse(row.value),updated:row.updated} : {signals:[],updated:null}; }
-function state(market){return {market,...snapshot(market),paused,running, keyHealth:keyPool.list().some(k=>k.status==='ready')?'Free-tier pool ready': 'LLM reasoning degraded — math signals only.', keyPool:keyPool.list(), readiness:null,positions:market==='indian'?indiaPaper.positions(snapshot(market)):[],learning:market==='indian'?indiaPaper.learning():[],paperProvider:market==='indian'?'Local simulator':'Alpaca paper',paperConfigured:market==='indian'||alpaca.configured,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['Manual paper orders only; no automatic strategy execution.','Readiness cannot be calculated without a verified trade ledger.']};}
+function state(market){const snap=snapshot(market);return {market,...snap,signals:snap.signals.map(s=>({...s,bookNotes:typeof s.strategy==='string'?bookKnowledge.forSignal(market,s.strategy):[]})),paused,running, keyHealth:keyPool.list().some(k=>k.status==='ready')?'Free-tier pool ready': 'LLM reasoning degraded — math signals only.', keyPool:keyPool.list(), readiness:null,positions:market==='indian'?indiaPaper.positions(snapshot(market)):[],learning:market==='indian'?indiaPaper.learning():[],paperProvider:market==='indian'?'Local simulator':'Alpaca paper',paperConfigured:market==='indian'||alpaca.configured,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['Manual paper orders only; no automatic strategy execution.','Readiness cannot be calculated without a verified trade ledger.']};}
 function broadcast(){ for(const res of listeners) res.write('data: update\n\n'); }
 function validSession(req){const token = /(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1]; if (!token) return false; const hash=createHash('sha256').update(token).digest('hex'); const session=sessions.get(hash); if (!session || session.expires<Date.now() || session.pinHash!==get('pin_hash')){sessions.delete(hash);return false;} return true;}
 function checkPin(req, pin) {

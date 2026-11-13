@@ -8,7 +8,8 @@
     "start": "npm run build && node server.js",
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.mjs",
-    "change-pin": "node tools/change-pin.mjs"
+    "change-pin": "node tools/change-pin.mjs",
+    "book-notes": "node tools/book-notes.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
