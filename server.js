@@ -5,6 +5,8 @@ import { extname, resolve, sep } from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { analyze } from './lib/quant.mjs';
+import { createIndiaPaper } from './lib/india-paper.mjs';
+import { createAlpacaPaper } from './lib/alpaca-paper.mjs';
 import { createKeyPool } from './lib/key-pool.mjs';
 import { validPin, hashPin, verifyPin, choosePin } from './lib/pin.mjs';
 
@@ -27,6 +29,9 @@ if (!get('pin_hash')) {
 }
 
 const keyPool = await createKeyPool(db, data);
+const indiaPaper=createIndiaPaper(db);
+const alpaca=createAlpacaPaper({keyId:process.env.ALPACA_PAPER_KEY_ID,secretKey:process.env.ALPACA_PAPER_SECRET_KEY});
+const paperRequests=new Set();
 const sessions = new Map(), attempts = new Map(), listeners = new Set();
 const validMarkets = ['indian','foreign','crypto'];
 const defaults = {indian:['RELIANCE.NS','INFY.NS','HDFCBANK.NS'],foreign:['AAPL','MSFT','SPY'],crypto:['BTC-USD','ETH-USD','SOL-USD']};
@@ -34,7 +39,7 @@ let paused = get('paused') === 'true', running = false, generation = 0, scanCont
 const types = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
 function send(res, status, value, extra={}) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}); res.end(JSON.stringify(value)); }
 function snapshot(market) { const row=db.prepare('SELECT value,updated FROM snapshots WHERE market=?').get(market); return row ? {signals:JSON.parse(row.value),updated:row.updated} : {signals:[],updated:null}; }
-function state(market){return {market,...snapshot(market),paused,running, keyHealth:keyPool.list().some(k=>k.status==='ready')?'Free-tier pool ready': 'LLM reasoning degraded — math signals only.', keyPool:keyPool.list(), readiness:null,positions:[],learning:null,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['No paper broker or automatic trading is configured.','Readiness cannot be calculated without a verified trade ledger.']};}
+function state(market){return {market,...snapshot(market),paused,running, keyHealth:keyPool.list().some(k=>k.status==='ready')?'Free-tier pool ready': 'LLM reasoning degraded — math signals only.', keyPool:keyPool.list(), readiness:null,positions:market==='indian'?indiaPaper.positions(snapshot(market)):[],learning:market==='indian'?indiaPaper.learning():[],paperProvider:market==='indian'?'Local simulator':'Alpaca paper',paperConfigured:market==='indian'||alpaca.configured,playbook:'Repo preset',mode:'paper',provider:'Yahoo Finance daily chart', limitations:['Manual paper orders only; no automatic strategy execution.','Readiness cannot be calculated without a verified trade ledger.']};}
 function broadcast(){ for(const res of listeners) res.write('data: update\n\n'); }
 function validSession(req){const token = /(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1]; if (!token) return false; const hash=createHash('sha256').update(token).digest('hex'); const session=sessions.get(hash); if (!session || session.expires<Date.now() || session.pinHash!==get('pin_hash')){sessions.delete(hash);return false;} return true;}
 function checkPin(req, pin) {
@@ -63,7 +68,8 @@ async function fetchSignal(market,symbol,signal){
  if(!Array.isArray(closes)) throw new Error('No price history available');
  const currency=chart.meta?.currency; const unit=currency==='INR'?'₹':currency==='USD'?'$':currency ? `${String(currency).replace(/[^A-Z]/g,'').slice(0,3)} ` : '';
  const result=analyze(symbol,closes,unit);
- const stamp=chart.timestamp?.at(-1); result.dataTime=Number.isFinite(stamp)?new Date(stamp*1000).toISOString():null;
+ const lastIndex=closes.findLastIndex(value=>typeof value==='number' && Number.isFinite(value) && value>0);
+ const stamp=chart.timestamp?.[lastIndex]; result.dataTime=Number.isFinite(stamp)?new Date(stamp*1000).toISOString():null;
  return result;
 }
 async function runScan(market,target,version,controller){
@@ -106,6 +112,28 @@ const handler=async(req,res)=>{
     const failure=checkPin(req,input.pin);
     if(failure) return send(res,failure.status,{error:failure.error});
     return send(res,503,{error:'Live trading is unavailable: no live broker or verified readiness gate is configured.'});
+   }
+   if(url.pathname==='/api/paper/positions' && req.method==='GET'){
+    const market=url.searchParams.get('market');if(!validMarkets.includes(market))return send(res,400,{error:'Invalid market'});
+    try {return send(res,200,{positions:market==='indian'?indiaPaper.positions(snapshot(market)):await alpaca.positions(market),provider:market==='indian'?'Local simulator':'Alpaca paper'});}catch(e){return send(res,503,{error:e.message});}
+   }
+   if(url.pathname==='/api/paper/open' && req.method==='POST'){
+    const input=await body(req);if(!validMarkets.includes(input.market)||typeof input.symbol!=='string'||typeof input.qty!=='number')return send(res,400,{error:'Invalid paper order.'});
+    if(paused)return send(res,409,{error:'Scans are paused. Resume before opening a paper position.'});
+    const s=snapshot(input.market).signals.find(item=>item.symbol===input.symbol);if(!s || s.direction!=='LONG')return send(res,400,{error:'A current long signal is required.'});
+    if(input.expectedDataTime!==s.dataTime || input.expectedClose!==s.rawClose)return send(res,409,{error:'The signal changed. Reopen it and review the current daily close before ordering.'});
+    const bar=Date.parse(s.dataTime||'');if(!Number.isFinite(bar)||bar>Date.now()+300000||Date.now()-bar>72*3600000)return send(res,400,{error:'A daily close no older than 72 hours is required. Run a fresh scan.'});
+    const lock=input.market+':'+input.symbol;if(paperRequests.has(lock))return send(res,409,{error:'A paper order is already being submitted.'});paperRequests.add(lock);
+    try {if(input.market==='indian'){indiaPaper.open(snapshot('indian'),input.symbol,input.qty);broadcast();return send(res,201,{status:'simulated',message:'Local paper position opened at the last daily close.'});}
+     const result=await alpaca.open(input.market,input.symbol,input.qty);broadcast();return send(res,202,{status:result.status,message:'Paper order submitted to Alpaca. A fill is not guaranteed; check your broker.'});
+    }catch(e){return send(res,400,{error:e.message});}finally{paperRequests.delete(lock);}
+   }
+   if(url.pathname==='/api/paper/close' && req.method==='POST'){
+    const input=await body(req);if(!validMarkets.includes(input.market)||typeof input.id!=='string'||input.id.length>100)return send(res,400,{error:'Invalid paper position.'});
+    const lock='close:'+input.market+':'+input.id;if(paperRequests.has(lock))return send(res,409,{error:'Close request already in progress.'});paperRequests.add(lock);
+    try {if(input.market==='indian'){indiaPaper.close(snapshot('indian'),input.id);broadcast();return send(res,200,{message:'Local paper position closed at the last daily close.'});}
+     const result=await alpaca.close(input.market,input.id);broadcast();return send(res,202,{status:result.status,message:'Close order submitted to Alpaca; the position remains until filled.'});
+    }catch(e){return send(res,400,{error:e.message});}finally{paperRequests.delete(lock);}
    }
    if(url.pathname==='/api/keys' && req.method==='GET') return send(res,200,{keys:keyPool.list(), canManage:secureKeyTransport(req)});
    if(url.pathname==='/api/keys' && req.method==='POST'){

@@ -1,1 +1,17 @@
-{"id":"preset:foreign","market":"foreign","name":"Foreign market preset","citations":["Edwards & Magee","Bulkowski","Murphy","Tharp"],"status":"reference only"}
+{
+  "id": "preset:foreign",
+  "market": "foreign",
+  "name": "Foreign market reference list",
+  "citations": ["Edwards & Magee", "Bulkowski", "Murphy", "Tharp"],
+  "status": "bibliographic references only; no book text or extracted strategies",
+  "references": [
+    {"title":"Technical Analysis of Stock Trends","author":"Robert D. Edwards and John Magee","category":"Patterns"},
+    {"title":"Encyclopedia of Chart Patterns","author":"Thomas N. Bulkowski","category":"Patterns"},
+    {"title":"Technical Analysis of the Financial Markets","author":"John J. Murphy","category":"Patterns"},
+    {"title":"Trade Your Way to Financial Freedom","author":"Van K. Tharp","category":"Risk and sizing"},
+    {"title":"Trading in the Zone","author":"Mark Douglas","category":"Psychology"},
+    {"title":"Market Wizards series","author":"Jack D. Schwager","category":"Trader interviews"},
+    {"title":"The World for Sale","author":"Javier Blas and Jack Farchy","category":"Commodity markets"},
+    {"title":"The Prize","author":"Daniel Yergin","category":"Commodity markets"}
+  ]
+}
