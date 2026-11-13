@@ -26,6 +26,11 @@ test('PIN authentication, same-origin writes and durable pause', async t=>{
  r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',key:secret})});assert.equal(r.status,201);const created=await r.json();assert.equal(JSON.stringify(created).includes(secret),false);const keyId=created.keys[0].id;
  r=await fetch(`${origin}/api/keys`,{headers:{cookie}});const listed=await r.json();assert.equal(listed.canManage,true);assert.equal(listed.keys.length,1);assert.equal(JSON.stringify(listed).includes(secret),false);
  r=await fetch(`${origin}/api/keys/remove`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',id:keyId})});assert.equal(r.status,200);assert.equal((await r.json()).keys.length,0);
+ const googleKey='AIza'+'a'.repeat(35);
+ r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',provider:'google',key:googleKey})});assert.equal(r.status,400);assert.match((await r.json()).error,/billing is disabled/);
+ r=await fetch(`${origin}/api/keys`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',provider:'google',key:googleKey,freeTierConfirmed:true})});assert.equal(r.status,201);const googleResult=await r.json();assert.equal(googleResult.keys[0].provider,'Google AI Studio');assert.equal(JSON.stringify(googleResult).includes(googleKey),false);
+ r=await fetch(`${origin}/api/keys/remove`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:JSON.stringify({pin:'123456',id:googleResult.keys[0].id})});assert.equal(r.status,200);
+
  // A session is not sufficient: live activation re-verifies the original PIN and always fails closed.
  r=await fetch(`${origin}/api/live/activate`,{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"market":"indian","pin":"123456"}'});assert.equal(r.status,401);
  r=await fetch(`${origin}/api/live/activate`,{method:'POST',headers:{cookie,origin:'http://evil.test','content-type':'application/json'},body:'{"market":"indian","pin":"123456"}'});assert.equal(r.status,403);
@@ -50,4 +55,15 @@ test('PIN authentication, same-origin writes and durable pause', async t=>{
  r=await fetch(`${origin}/api/unlock`,{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"pin":"123456"}'});assert.equal(r.status,401);
  r=await fetch(`${origin}/api/unlock`,{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"pin":"654321"}'});assert.equal(r.status,200);
 
+});
+
+test('pause cancels an in-flight market data request',async t=>{
+ const data=await mkdtemp(join(tmpdir(),'aperture-cancel-'));const port=await new Promise(resolve=>{const s=net.createServer();s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>resolve(p));});});
+ const origin=`http://127.0.0.1:${port}`;const child=spawn(process.execPath,['--import','./test/fixtures/abort-feed.mjs','server.js'],{env:{...process.env,PORT:String(port),APERTURE_PIN:'123456',APERTURE_DATA_DIR:data},stdio:['ignore','pipe','pipe']});
+ t.after(async()=>{if(child.exitCode===null){child.kill();await new Promise(resolve=>child.once('exit',resolve));}await rm(data,{recursive:true,force:true});});
+ let log='';const waitFor=needle=>new Promise((resolve,reject)=>{if(log.includes(needle))return resolve();const timer=setTimeout(()=>reject(new Error(`Timed out waiting for ${needle}`)),5000);const onData=chunk=>{log+=chunk.toString();if(log.includes(needle)){clearTimeout(timer);child.stdout.off('data',onData);resolve();}};child.stdout.on('data',onData);});
+ await waitFor('LAN accessible');let r=await fetch(`${origin}/api/unlock`,{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"pin":"123456"}'});const cookie=r.headers.get('set-cookie').split(';')[0];
+ r=await fetch(`${origin}/api/run`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:'{"market":"indian","target":"INFY"}'});assert.equal(r.status,202);
+ const aborted=waitFor('TEST_FEED_ABORTED');r=await fetch(`${origin}/api/pause`,{method:'POST',headers:{cookie,origin,'content-type':'application/json'},body:'{"paused":true}'});assert.equal(r.status,200);await aborted;
+ r=await fetch(`${origin}/api/state?market=indian`,{headers:{cookie}});const state=await r.json();assert.equal(state.paused,true);assert.equal(state.running,false);assert.deepEqual(state.signals,[]);
 });

@@ -30,7 +30,7 @@ const keyPool = await createKeyPool(db, data);
 const sessions = new Map(), attempts = new Map(), listeners = new Set();
 const validMarkets = ['indian','foreign','crypto'];
 const defaults = {indian:['RELIANCE.NS','INFY.NS','HDFCBANK.NS'],foreign:['AAPL','MSFT','SPY'],crypto:['BTC-USD','ETH-USD','SOL-USD']};
-let paused = get('paused') === 'true', running = false, generation = 0;
+let paused = get('paused') === 'true', running = false, generation = 0, scanController = null;
 const types = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.json':'application/json; charset=utf-8','.webmanifest':'application/manifest+json','.svg':'image/svg+xml'};
 function send(res, status, value, extra={}) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...extra}); res.end(JSON.stringify(value)); }
 function snapshot(market) { const row=db.prepare('SELECT value,updated FROM snapshots WHERE market=?').get(market); return row ? {signals:JSON.parse(row.value),updated:row.updated} : {signals:[],updated:null}; }
@@ -56,8 +56,8 @@ function secureKeyTransport(req){
 function sameOrigin(req){ try { return !!req.headers.origin && new URL(req.headers.origin).host === req.headers.host; } catch {return false;} }
 async function body(req){let text=''; for await (const chunk of req){text+=chunk;if(text.length>4096) throw new Error('Request too large');}return JSON.parse(text||'{}');}
 function mappedSymbol(market, input) { const s=input.trim().toUpperCase(); if(!/^[A-Z0-9][A-Z0-9.\-^=]{0,19}$/.test(s)) throw new Error('Invalid symbol'); if(market==='indian' && !s.includes('.')) return `${s}.NS`; if(market==='crypto' && !s.includes('-')) return `${s}-USD`; return s; }
-async function fetchSignal(market,symbol){
- const response=await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d`, {headers:{'User-Agent':'Aperture-Phone/1.0'},signal:AbortSignal.timeout(12000)});
+async function fetchSignal(market,symbol,signal){
+ const response=await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d`, {headers:{'User-Agent':'Aperture-Phone/1.0'},signal:AbortSignal.any([signal,AbortSignal.timeout(12000)])});
  if(!response.ok) throw new Error(`Data provider returned ${response.status}`);
  const json=await response.json(); const chart=json?.chart?.result?.[0]; const closes=chart?.indicators?.quote?.[0]?.close;
  if(!Array.isArray(closes)) throw new Error('No price history available');
@@ -66,23 +66,23 @@ async function fetchSignal(market,symbol){
  const stamp=chart.timestamp?.at(-1); result.dataTime=Number.isFinite(stamp)?new Date(stamp*1000).toISOString():null;
  return result;
 }
-async function runScan(market,target,version){
+async function runScan(market,target,version,controller){
  try {
    const symbols=target?[mappedSymbol(market,target)]:defaults[market];
-   const results=await Promise.allSettled(symbols.map(s=>fetchSignal(market,s)));
+   const results=await Promise.allSettled(symbols.map(s=>fetchSignal(market,s,controller.signal)));
    if (version!==generation || paused) return;
    const signals=results.filter(r=>r.status==='fulfilled').map(r=>r.value).sort((a,b)=>b.conviction-a.conviction);
    if(signals.length){
      const writeSnapshot=()=>db.prepare('INSERT INTO snapshots VALUES (?,?,?) ON CONFLICT(market) DO UPDATE SET value=excluded.value,updated=excluded.updated').run(market,JSON.stringify(signals),new Date().toISOString());
      // Publish the quant result first; a slow or unavailable model must not hold it back.
      writeSnapshot();lastMessage='Quant signals ready; checking the free model pool…';broadcast();
-     const summary=await keyPool.synthesize(signals);
+     const summary=await keyPool.synthesize(signals,{signal:controller.signal});
      if (version!==generation || paused) return;
      if(summary) {signals[0].llmNote=summary;writeSnapshot();}
    }
    lastMessage=signals.length ? `Updated ${signals.length} of ${symbols.length} symbols from the free daily feed.` : 'Data feed unavailable. The previous snapshot was kept.';
  } catch(e){lastMessage=e.message||'Scan failed. The previous snapshot was kept.';}
- finally {running=false;broadcast();}
+ finally {running=false;if(scanController===controller)scanController=null;broadcast();}
 }
 let lastMessage='';
 const handler=async(req,res)=>{
@@ -112,7 +112,7 @@ const handler=async(req,res)=>{
     if(!secureKeyTransport(req)) return send(res,403,{error:'Manage keys on localhost or through direct HTTPS; remote HTTP is not secure.'});
     const input=await body(req), failure=checkPin(req,input.pin);
     if(failure) return send(res,failure.status,{error:failure.error});
-    try {keyPool.add(input.key);broadcast();return send(res,201,{ok:true,keys:keyPool.list()});}
+    try {keyPool.add(input.key,input.provider,input.freeTierConfirmed);broadcast();return send(res,201,{ok:true,keys:keyPool.list()});}
     catch(e) {return send(res,400,{error:e.message});}
    }
    if(url.pathname==='/api/keys/remove' && req.method==='POST'){
@@ -125,8 +125,8 @@ const handler=async(req,res)=>{
    if(url.pathname==='/api/logout' && req.method==='POST'){const token=/(?:^|;\s*)aperture_session=([a-f0-9]+)/.exec(req.headers.cookie||'')?.[1];if(token)sessions.delete(createHash('sha256').update(token).digest('hex'));return send(res,200,{ok:true},{'Set-Cookie':'aperture_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
    if(url.pathname==='/api/state' && req.method==='GET'){const market=url.searchParams.get('market');if(!validMarkets.includes(market))return send(res,400,{error:'Invalid market'});return send(res,200,{...state(market),message:lastMessage});}
    if(url.pathname==='/api/events' && req.method==='GET'){res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});res.write(': connected\n\n');listeners.add(res);req.on('close',()=>listeners.delete(res));return;}
-   if(url.pathname==='/api/run' && req.method==='POST'){const input=await body(req);if(!validMarkets.includes(input.market))return send(res,400,{error:'Invalid market'});if(paused)return send(res,409,{error:'Engine paused. Resume before running.'});if(running)return send(res,409,{error:'A scan is already running.'});try {if(input.target) mappedSymbol(input.market,String(input.target));}catch(e){return send(res,400,{error:e.message});}running=true;lastMessage='Scan running…';broadcast();void runScan(input.market,String(input.target||''),generation);return send(res,202,{ok:true});}
-   if(url.pathname==='/api/pause' && req.method==='POST'){const input=await body(req);if(typeof input.paused!=='boolean')return send(res,400,{error:'Invalid state'});paused=input.paused;set('paused',String(paused));if(paused)generation++;lastMessage=paused?'Engine paused. An in-flight scan will be discarded.':'Engine resumed.';broadcast();return send(res,200,{ok:true,paused});}
+   if(url.pathname==='/api/run' && req.method==='POST'){const input=await body(req);if(!validMarkets.includes(input.market))return send(res,400,{error:'Invalid market'});if(paused)return send(res,409,{error:'Engine paused. Resume before running.'});if(running)return send(res,409,{error:'A scan is already running.'});try {if(input.target) mappedSymbol(input.market,String(input.target));}catch(e){return send(res,400,{error:e.message});}running=true;scanController=new AbortController();lastMessage='Scan running…';broadcast();void runScan(input.market,String(input.target||''),generation,scanController);return send(res,202,{ok:true});}
+   if(url.pathname==='/api/pause' && req.method==='POST'){const input=await body(req);if(typeof input.paused!=='boolean')return send(res,400,{error:'Invalid state'});paused=input.paused;set('paused',String(paused));if(paused){generation++;scanController?.abort();}lastMessage=paused?'Engine paused. Cancellation requested; an upstream request may already have been processed.':'Engine resumed.';broadcast();return send(res,200,{ok:true,paused});}
    return send(res,404,{error:'Not found'});
   }
   if(req.method!=='GET' && req.method!=='HEAD'){res.writeHead(405).end();return;}
