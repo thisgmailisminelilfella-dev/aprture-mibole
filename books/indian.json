@@ -1,1 +1,15 @@
-{"id":"preset:indian","market":"indian","name":"Indian market preset","citations":["Sadekar","Bulkowski","Nison"],"status":"reference only"}
+{
+  "id": "preset:indian",
+  "market": "indian",
+  "name": "Indian market reference list",
+  "citations": ["Sadekar", "Bulkowski", "Nison"],
+  "status": "bibliographic references only; no book text or extracted strategies",
+  "references": [
+    {"title":"How to Make Money Trading with Candlestick Charts","author":"B. M. Sadekar","category":"Patterns"},
+    {"title":"Encyclopedia of Chart Patterns","author":"Thomas N. Bulkowski","category":"Patterns"},
+    {"title":"Japanese Candlestick Charting Techniques","author":"Steve Nison","category":"Patterns"},
+    {"title":"How to Make Money Trading Derivatives","author":"Ashwani Gujral","category":"Strategy"},
+    {"title":"Trading in the Zone","author":"Mark Douglas","category":"Psychology"},
+    {"title":"The New Trading for a Living","author":"Alexander Elder","category":"Risk and sizing"}
+  ]
+}
